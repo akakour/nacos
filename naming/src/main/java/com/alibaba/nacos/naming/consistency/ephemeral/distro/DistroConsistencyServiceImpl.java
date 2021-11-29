@@ -93,19 +93,38 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
 
     private Map<String, String> syncChecksumTasks = new ConcurrentHashMap<>(16);
 
+    /**
+     * springboot 容器初始化的过程中，调用init方法
+     * 顺便
+     * 1. nacos节点一致性，初始化服务信息同步
+     * 2. 初始化监听器，notifier -> start,监听各个recoderlistener（service，servicemanage，switchservice），
+     * notifier有个queue，循环异步执行各个监听器，
+     * 如 instance的onchange事件，delete事件。
+     * cluster的onchange，delete事件
+     */
     @PostConstruct
     public void init() {
+        // 执行一致性算法 loadDataTask，同步nacos节点
         GlobalExecutor.submit(loadDataTask);
+        // 执行监听器 notifier
         GlobalExecutor.submitDistroNotifyTask(notifier);
     }
 
+    /**
+     * nacos集群节点间，信息同步
+     */
     private class LoadDataTask implements Runnable {
 
         @Override
         public void run() {
             try {
+                /**
+                 * 同步集群信息
+                 */
                 load();
+               //load() 执行完后
                 if (!initialized) {
+                    // 单次延迟执行
                     GlobalExecutor.submit(this, globalConfig.getLoadDataRetryDelayMillis());
                 }
             } catch (Exception e) {
@@ -114,18 +133,27 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
         }
     }
 
+    /**
+     * 同步集群信息
+     * @throws Exception
+     */
     public void load() throws Exception {
+        // 启动参数 nacos.standalone 默认为false，以集群方式启动
         if (SystemUtils.STANDALONE_MODE) {
+            // nacos以单节点形式启动
             initialized = true;
             return;
         }
         // size = 1 means only myself in the list, we need at least one another server alive:
+        // 检测nacos集群健康节点数：其他节点没有启动完成的时候，while死循环，本子线程阻塞。
         while (serverListManager.getHealthyServers().size() <= 1) {
             Thread.sleep(1000L);
             Loggers.DISTRO.info("waiting server list init...");
         }
 
+        //获取nacos集群的健康的子节点
         for (Server server : serverListManager.getHealthyServers()) {
+            //自己本身跳过
             if (NetUtils.localServer().equals(server.getKey())) {
                 continue;
             }
@@ -133,6 +161,7 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
                 Loggers.DISTRO.debug("sync from " + server);
             }
             // try sync data from remote server:
+            // 从其他节点同步instance信息给自己
             if (syncAllDataFromRemote(server)) {
                 initialized = true;
                 return;
@@ -142,7 +171,14 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
 
     @Override
     public void put(String key, Record value) throws NacosException {
+        /**
+         * 1. 将instance信息保存在datastore中，以便于集群间同步
+         * 2. 给监听器发送onchange通知，根据key不同， 监听器执行
+         *    1）instance change --> com.alibaba.nacos.naming.core.Service#onChange(java.lang.String, com.alibaba.nacos.naming.core.Instances)
+         *    2）cluster change --> com.alibaba.nacos.naming.core.ServiceManager#onChange(java.lang.String, com.alibaba.nacos.naming.core.Service)
+         */
         onPut(key, value);
+
         taskDispatcher.addTask(key);
     }
 
@@ -157,6 +193,12 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
         return dataStore.get(key);
     }
 
+    /**
+     * 将instance信息存储到本地，并且发送监听器onchange通知
+     *
+     * @param key
+     * @param value
+     */
     public void onPut(String key, Record value) {
 
         if (KeyBuilder.matchEphemeralInstanceListKey(key)) {
@@ -164,6 +206,7 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
             datum.value = (Instances) value;
             datum.key = key;
             datum.timestamp.incrementAndGet();
+            // 存储到datastore对象中（本地）
             dataStore.put(key, datum);
         }
 
@@ -171,9 +214,17 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
             return;
         }
 
+        //给服务监听器添加一条onchange事件。
+        // 异步处理。
+        // 观察者设计模式的落地实现
         notifier.addTask(key, ApplyAction.CHANGE);
     }
 
+    /**
+     * 将instance信息从本地删除，并且发送监听器ondelete通知
+     *
+     * @param key
+     */
     public void onRemove(String key) {
 
         dataStore.remove(key);
@@ -182,6 +233,7 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
             return;
         }
 
+        // 监听器delete通知
         notifier.addTask(key, ApplyAction.DELETE);
     }
 
@@ -250,10 +302,18 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
 
     }
 
+    /**
+     * 从其他nacos集群节点同步信息
+     *
+     * @param server
+     * @return
+     */
     public boolean syncAllDataFromRemote(Server server) {
 
         try {
+            // http 请求获取server节点的服务注册信息
             byte[] data = NamingProxy.getAllData(server.getKey());
+            // 解析获取到的信息，同步信息
             processData(data);
             return true;
         } catch (Exception e) {
@@ -262,15 +322,25 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
         }
     }
 
+    /**
+     * 解析并同步集群服务注册信息
+     * @param data
+     * @throws Exception
+     */
     public void processData(byte[] data) throws Exception {
         if (data.length > 0) {
+            // 反序列化
+            // -> com.alibaba.nacos.naming.cluster.transport.FastJsonSerializer.deserialize(byte[], com.alibaba.fastjson.TypeReference<T>)
             Map<String, Datum<Instances>> datumMap =
                 serializer.deserializeMap(data, Instances.class);
 
-
+            // 遍历，判断，同步集群
             for (Map.Entry<String, Datum<Instances>> entry : datumMap.entrySet()) {
                 dataStore.put(entry.getKey(), entry.getValue());
 
+                //判断是否存在本节点的listeners 中，若已经存在就不同步该信息
+                //往本节点注册的服务处理之后，会将Serviceid作为key添加进listeners
+                // 理论上，新上线nacos节点，listeners只有一个com.alibaba.nacos.naming.domains.meta.的key
                 if (!listeners.containsKey(entry.getKey())) {
                     // pretty sure the service not exist:
                     if (switchDomain.isDefaultInstanceEphemeral()) {
@@ -285,12 +355,15 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
                         // now validate the service. if failed, exception will be thrown
                         service.setLastModifiedMillis(System.currentTimeMillis());
                         service.recalculateChecksum();
+                        //同步来的信息，由com.alibaba.nacos.naming.domains.meta.去做change事件通知
+                        //     -> 将service注册到ServiceMap和datastore
                         listeners.get(KeyBuilder.SERVICE_META_KEY_PREFIX).get(0)
                             .onChange(KeyBuilder.buildServiceMetaKey(namespaceId, serviceName), service);
                     }
                 }
             }
 
+            //同步了信息之后
             for (Map.Entry<String, Datum<Instances>> entry : datumMap.entrySet()) {
 
                 if (!listeners.containsKey(entry.getKey())) {
@@ -301,6 +374,7 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
 
                 try {
                     for (RecordListener listener : listeners.get(entry.getKey())) {
+                        //给每个监听器发布一个通知，直接调用serivice/serviceManage的onchange方法
                         listener.onChange(entry.getKey(), entry.getValue().value);
                     }
                 } catch (Exception e) {
@@ -309,6 +383,10 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
                 }
 
                 // Update data store if listener executed successfully:
+                // 最终新增到本节点的datastore,
+                // 注意，这里还是在springboot ioc实例化的时候
+                //   -> com.alibaba.nacos.naming.consistency.ephemeral.distro.DistroConsistencyServiceImpl.init
+                //   所以此时nacos还没有启动完毕，不会接受服务注册，datastore不需要发布curd信息给其他节点
                 dataStore.put(entry.getKey(), entry.getValue());
             }
         }
@@ -355,6 +433,14 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
 
         private BlockingQueue<Pair> tasks = new LinkedBlockingQueue<Pair>(1024 * 1024);
 
+        /**
+         * 往堵塞队列中添加一条动作信息
+         * 该堵塞队列被Notifier 调度线程一直监控
+         * Notifier#run()
+         *
+         * @param datumKey
+         * @param action
+         */
         public void addTask(String datumKey, ApplyAction action) {
 
             if (services.containsKey(datumKey) && action == ApplyAction.CHANGE) {
@@ -363,6 +449,7 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
             if (action == ApplyAction.CHANGE) {
                 services.put(datumKey, StringUtils.EMPTY);
             }
+            // 往堵塞队列中塞入一条动作信息
             tasks.add(Pair.with(datumKey, action));
         }
 
@@ -377,6 +464,8 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
             while (true) {
                 try {
 
+                    //以堵塞的方式（有数据就取，无数据就等待堵塞）获取数据
+                    // Pair  ——> 一种键值对数据结构
                     Pair pair = tasks.take();
 
                     if (pair == null) {
@@ -386,6 +475,7 @@ public class DistroConsistencyServiceImpl implements EphemeralConsistencyService
                     String datumKey = (String) pair.getValue0();
                     ApplyAction action = (ApplyAction) pair.getValue1();
 
+                    //
                     services.remove(datumKey);
 
                     int count = 0;

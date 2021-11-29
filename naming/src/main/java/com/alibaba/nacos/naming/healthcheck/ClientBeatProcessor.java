@@ -59,6 +59,9 @@ public class ClientBeatProcessor implements Runnable {
         this.service = service;
     }
 
+    /**
+     * 心跳更新任务
+     */
     @Override
     public void run() {
         Service service = this.service;

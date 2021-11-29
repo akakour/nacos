@@ -102,10 +102,15 @@ public class Service extends com.alibaba.nacos.api.naming.pojo.Service implement
         this.ipDeleteTimeout = ipDeleteTimeout;
     }
 
+    /**
+     * 更新心跳
+     * @param rsInfo
+     */
     public void processClientBeat(final RsInfo rsInfo) {
         ClientBeatProcessor clientBeatProcessor = new ClientBeatProcessor();
         clientBeatProcessor.setService(this);
         clientBeatProcessor.setRsInfo(rsInfo);
+        //交于reactor去执行心跳更新，立马执行clientBeatProcessor
         HealthCheckReactor.scheduleNow(clientBeatProcessor);
     }
 
@@ -151,6 +156,12 @@ public class Service extends com.alibaba.nacos.api.naming.pojo.Service implement
         return KeyBuilder.matchInstanceListKey(key, namespaceId, getName());
     }
 
+    /**
+     * instance的change事件，观察者设计模式
+     * @param key   target key
+     * @param value data of the key
+     * @throws Exception
+     */
     @Override
     public void onChange(String key, Instances value) throws Exception {
 
@@ -199,6 +210,7 @@ public class Service extends com.alibaba.nacos.api.naming.pojo.Service implement
 
     public void updateIPs(Collection<Instance> instances, boolean ephemeral) {
         Map<String, List<Instance>> ipMap = new HashMap<>(clusterMap.size());
+        //获取现存的cluster到ipmap对象中，后续可以用以判断是否需要新加cluster
         for (String clusterName : clusterMap.keySet()) {
             ipMap.put(clusterName, new ArrayList<>());
         }
@@ -214,20 +226,26 @@ public class Service extends com.alibaba.nacos.api.naming.pojo.Service implement
                     instance.setClusterName(UtilsAndCommons.DEFAULT_CLUSTER_NAME);
                 }
 
+                // 如果instance是完全新增的，新建cluster
                 if (!clusterMap.containsKey(instance.getClusterName())) {
                     Loggers.SRV_LOG.warn("cluster: {} not found, ip: {}, will create new cluster with default configuration.",
                         instance.getClusterName(), instance.toJSON());
+                    // 新建cluster
                     Cluster cluster = new Cluster(instance.getClusterName(), this);
+                    // cluster初始化
                     cluster.init();
+                    //将cluster添加到clustermap
                     getClusterMap().put(instance.getClusterName(), cluster);
                 }
 
+                //获取同一个客户端服务的所有instance IP
                 List<Instance> clusterIPs = ipMap.get(instance.getClusterName());
                 if (clusterIPs == null) {
                     clusterIPs = new LinkedList<>();
                     ipMap.put(instance.getClusterName(), clusterIPs);
                 }
 
+                //将 新增instance 的ip加入
                 clusterIPs.add(instance);
             } catch (Exception e) {
                 Loggers.SRV_LOG.error("[NACOS-DOM] failed to process ip: " + instance, e);
@@ -237,11 +255,16 @@ public class Service extends com.alibaba.nacos.api.naming.pojo.Service implement
         for (Map.Entry<String, List<Instance>> entry : ipMap.entrySet()) {
             //make every ip mine
             List<Instance> entryIPs = entry.getValue();
+            //更新 instance ips TODO 会做排他
             clusterMap.get(entry.getKey()).updateIPs(entryIPs, ephemeral);
         }
 
         setLastModifiedMillis(System.currentTimeMillis());
+        // 发布 ServiceChangeEvent 事件，被com.alibaba.nacos.naming.push.PushService 监听到 异步调用PushService的onApplicationEvent方法
+        //   -> com.alibaba.nacos.naming.push.PushService.onApplicationEvent
+        // 通知所有udp连接到本nacos的客户端 TODO
         getPushService().serviceChanged(this);
+
         StringBuilder stringBuilder = new StringBuilder();
 
         for (Instance instance : allIPs()) {
@@ -253,6 +276,9 @@ public class Service extends com.alibaba.nacos.api.naming.pojo.Service implement
 
     }
 
+    /**
+     * 启动 心跳检查任务
+     */
     public void init() {
 
         HealthCheckReactor.scheduleCheck(clientBeatCheckTask);

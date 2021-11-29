@@ -102,12 +102,17 @@ public class Cluster extends com.alibaba.nacos.api.naming.pojo.Cluster implement
         return ephemeral ? new ArrayList<>(ephemeralInstances) : new ArrayList<>(persistentInstances);
     }
 
+    /**
+     * cluster初始化
+     */
     public void init() {
         if (inited) {
             return;
         }
+        //cluster 健康检查task初始化
         checkTask = new HealthCheckTask(this);
 
+        //将cluster健康检查task添加到调度池
         HealthCheckReactor.scheduleCheck(checkTask);
         inited = true;
     }

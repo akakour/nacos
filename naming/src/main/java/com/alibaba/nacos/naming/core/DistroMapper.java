@@ -63,6 +63,11 @@ public class DistroMapper implements ServerChangeListener {
             && cluster.contains(instance);
     }
 
+    /**
+     * 判断是否应该把该请求交于本nacos node处理
+     * @param serviceName
+     * @return
+     */
     public boolean responsible(String serviceName) {
         if (!switchDomain.isDistroEnabled() || SystemUtils.STANDALONE_MODE) {
             return true;
@@ -78,7 +83,7 @@ public class DistroMapper implements ServerChangeListener {
         if (lastIndex < 0 || index < 0) {
             return true;
         }
-
+        //哈希取模
         int target = distroHash(serviceName) % healthyList.size();
         return target >= index && target <= lastIndex;
     }

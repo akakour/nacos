@@ -90,7 +90,14 @@ public class InstanceController {
     };
 
 
-    @CanDistro
+    /**
+     * 服务注册   post  /v1/ns/instance
+     *
+     * @param request
+     * @return
+     * @throws Exception
+     */
+    @CanDistro  //filter 判断是否应该把该请求交于本nacos node处理
     @PostMapping
     @Secured(parser = NamingResourceParser.class, action = ActionTypes.WRITE)
     public String register(HttpServletRequest request) throws Exception {
@@ -98,10 +105,19 @@ public class InstanceController {
         String serviceName = WebUtils.required(request, CommonParams.SERVICE_NAME);
         String namespaceId = WebUtils.optional(request, CommonParams.NAMESPACE_ID, Constants.DEFAULT_NAMESPACE_ID);
 
+        //服务注册 伴随着事件通知，有集群间信息同步，订阅者的本地缓存更新
+        // 创建一个空service（如果是第一次）--> 获得service --> 往service里面添加instance
+        //服务信息保存在两个对象中，serviceMap和datastore，前者层级复杂，用于nacos node的curd，后者结构扁平，用于nacos集群间同步
         serviceManager.registerInstance(namespaceId, serviceName, parseInstance(request));
         return "ok";
     }
 
+    /**
+     * 服务下线
+     * @param request
+     * @return
+     * @throws Exception
+     */
     @CanDistro
     @DeleteMapping
     @Secured(parser = NamingResourceParser.class, action = ActionTypes.WRITE)
@@ -116,12 +132,18 @@ public class InstanceController {
             Loggers.SRV_LOG.warn("remove instance from non-exist service: {}", serviceName);
             return "ok";
         }
-
+        //将该实例从servicerMap中剔除，伴随着一系列事件通知，有集群同步，订阅的客户端更新
         serviceManager.removeInstance(namespaceId, serviceName, instance.isEphemeral(), instance);
 
         return "ok";
     }
 
+    /**
+     * 服务更新
+     * @param request
+     * @return
+     * @throws Exception
+     */
     @CanDistro
     @PutMapping
     @Secured(parser = NamingResourceParser.class, action = ActionTypes.WRITE)
@@ -135,8 +157,10 @@ public class InstanceController {
 
         if (clientInfo.type == ClientInfo.ClientType.JAVA &&
             clientInfo.version.compareTo(VersionUtil.parseVersion("1.0.0")) >= 0) {
+            //服务更新
             serviceManager.updateInstance(namespaceId, serviceName, parseInstance(request));
         } else {
+            //服务注册
             serviceManager.registerInstance(namespaceId, serviceName, parseInstance(request));
         }
         return "ok";
@@ -187,6 +211,12 @@ public class InstanceController {
         return "ok";
     }
 
+    /**
+     * 获取具体服务的所有实例列表
+     * @param request
+     * @return
+     * @throws Exception
+     */
     @GetMapping("/list")
     @Secured(parser = NamingResourceParser.class, action = ActionTypes.READ)
     public JSONObject list(HttpServletRequest request) throws Exception {
@@ -255,6 +285,12 @@ public class InstanceController {
         throw new NacosException(NacosException.NOT_FOUND, "no matched ip found!");
     }
 
+    /**
+     * 服务续约 心跳
+     * @param request
+     * @return
+     * @throws Exception
+     */
     @CanDistro
     @PutMapping("/beat")
     @Secured(parser = NamingResourceParser.class, action = ActionTypes.WRITE)
@@ -308,7 +344,7 @@ public class InstanceController {
             instance.setServiceName(serviceName);
             instance.setInstanceId(instance.getInstanceId());
             instance.setEphemeral(clientBeat.isEphemeral());
-
+            //弱网络情况下，心跳先于注册，万恶的源头----> 服务注册时，加锁以后，仍需要二次判断
             serviceManager.registerInstance(namespaceId, serviceName, instance);
         }
 
@@ -324,6 +360,7 @@ public class InstanceController {
             clientBeat.setPort(port);
             clientBeat.setCluster(clusterName);
         }
+        //异步，交于一个行程组去更新心跳
         service.processClientBeat(clientBeat);
 
         result.put(CommonParams.CODE, NamingResponseCode.OK);
@@ -365,6 +402,12 @@ public class InstanceController {
         return result;
     }
 
+    /**
+     * 根据request 实例一个instance
+     * @param request
+     * @return
+     * @throws Exception
+     */
     private Instance parseInstance(HttpServletRequest request) throws Exception {
 
         String serviceName = WebUtils.required(request, CommonParams.SERVICE_NAME);

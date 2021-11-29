@@ -125,6 +125,10 @@ public class GlobalExecutor {
             }
     );
 
+    /**
+     * 监听器调度线程池（观察者模式的落地）
+     * 单线程
+     */
     private static ScheduledExecutorService distroNotifyExecutor = new ScheduledThreadPoolExecutor(1, new ThreadFactory() {
         @Override
         public Thread newThread(Runnable r) {
@@ -190,6 +194,10 @@ public class GlobalExecutor {
         executorService.schedule(runnable, delay, TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * 提交监听器task
+     * @param runnable
+     */
     public static void submitDistroNotifyTask(Runnable runnable) {
         distroNotifyExecutor.submit(runnable);
     }

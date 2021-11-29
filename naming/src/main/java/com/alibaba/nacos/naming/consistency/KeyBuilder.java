@@ -61,6 +61,11 @@ public class KeyBuilder {
         return SERVICE_META_KEY_PREFIX + UtilsAndCommons.SWITCH_DOMAIN_NAME;
     }
 
+    /**
+     * 判断是否为临时实例
+     * @param key
+     * @return
+     */
     public static boolean matchEphemeralInstanceListKey(String key) {
         return key.startsWith(INSTANCE_LIST_KEY_PREFIX + EPHEMERAL_KEY_PREFIX);
     }

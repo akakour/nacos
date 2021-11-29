@@ -93,9 +93,18 @@ public class NamingProxy {
             + result.code + " msg: " + result.content);
     }
 
+    /**
+     * 获取其他nacos节点的服务注册信息
+     * 通过http请求，请求/distro/datums mapping
+     *  -> com.alibaba.nacos.naming.controllers.DistroController#getAllDatums()
+     * @param server
+     * @return
+     * @throws Exception
+     */
     public static byte[] getAllData(String server) throws Exception {
 
         Map<String, String> params = new HashMap<>(8);
+        // 调用httpclient发送http请求
         HttpClient.HttpResult result = HttpClient.httpGet("http://" + server + RunningConfig.getContextPath()
             + UtilsAndCommons.NACOS_NAMING_CONTEXT + ALL_DATA_GET_URL, new ArrayList<>(), params);
 
@@ -112,7 +121,7 @@ public class NamingProxy {
 
     public static boolean syncData(byte[] data, String curServer) {
         Map<String, String> headers = new HashMap<>(128);
-        
+
         headers.put(HttpHeaderConsts.CLIENT_VERSION_HEADER, VersionUtils.VERSION);
         headers.put(HttpHeaderConsts.USER_AGENT_HEADER, UtilsAndCommons.SERVER_VERSION);
         headers.put("Accept-Encoding", "gzip,deflate,sdch");

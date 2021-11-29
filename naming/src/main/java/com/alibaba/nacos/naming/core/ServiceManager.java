@@ -29,34 +29,10 @@ import com.alibaba.nacos.naming.consistency.KeyBuilder;
 import com.alibaba.nacos.naming.consistency.RecordListener;
 import com.alibaba.nacos.naming.consistency.persistent.raft.RaftPeer;
 import com.alibaba.nacos.naming.consistency.persistent.raft.RaftPeerSet;
-import com.alibaba.nacos.naming.misc.GlobalExecutor;
-import com.alibaba.nacos.naming.misc.Loggers;
-import com.alibaba.nacos.naming.misc.Message;
-import com.alibaba.nacos.naming.misc.NamingProxy;
-import com.alibaba.nacos.naming.misc.NetUtils;
-import com.alibaba.nacos.naming.misc.ServiceStatusSynchronizer;
-import com.alibaba.nacos.naming.misc.SwitchDomain;
-import com.alibaba.nacos.naming.misc.Synchronizer;
-import com.alibaba.nacos.naming.misc.UtilsAndCommons;
+import com.alibaba.nacos.naming.misc.*;
 import com.alibaba.nacos.naming.push.PushService;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.StringJoiner;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
-import javax.annotation.PostConstruct;
-import javax.annotation.Resource;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -64,6 +40,17 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.DependsOn;
 import org.springframework.stereotype.Component;
 import org.springframework.util.CollectionUtils;
+
+import javax.annotation.PostConstruct;
+import javax.annotation.Resource;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Core manager storing all services in Nacos
@@ -275,8 +262,8 @@ public class ServiceManager implements RecordListener<Service> {
         matchList.add(localRaftPeer);
         Set<String> otherServerSet = raftPeerSet.allServersWithoutMySelf();
         if (null != otherServerSet && otherServerSet.size() > 0) {
-            for (String server: otherServerSet) {
-                String path =  UtilsAndCommons.NACOS_NAMING_OPERATOR_CONTEXT + UtilsAndCommons.NACOS_NAMING_CLUSTER_CONTEXT + "/state";
+            for (String server : otherServerSet) {
+                String path = UtilsAndCommons.NACOS_NAMING_OPERATOR_CONTEXT + UtilsAndCommons.NACOS_NAMING_CLUSTER_CONTEXT + "/state";
                 Map<String, String> params = Maps.newHashMapWithExpectedSize(2);
                 try {
                     String content = NamingProxy.reqCommon(path, params, server, false);
@@ -458,17 +445,30 @@ public class ServiceManager implements RecordListener<Service> {
         createServiceIfAbsent(namespaceId, serviceName, local, null);
     }
 
+    /**
+     * 创建服务
+     *
+     * @param namespaceId
+     * @param serviceName
+     * @param local
+     * @param cluster
+     * @throws NacosException
+     */
     public void createServiceIfAbsent(String namespaceId, String serviceName, boolean local, Cluster cluster) throws NacosException {
+        //Q：为什么要【判断是否以及存在？理论上不是肯定不存在？
+        //A: servicemanage单例。多线程不安全。有可能心跳早于注册（网络波动，注册失败），心跳处理里面，如果发现本服务没有注册过，会先注册在心跳（更新最终修改时间）
         Service service = getService(namespaceId, serviceName);
         if (service == null) {
 
             Loggers.SRV_LOG.info("creating empty service {}:{}", namespaceId, serviceName);
+            //new 一个service，并设置属性
             service = new Service();
             service.setName(serviceName);
             service.setNamespaceId(namespaceId);
             service.setGroupName(NamingUtils.getGroupName(serviceName));
             // now validate the service. if failed, exception will be thrown
             service.setLastModifiedMillis(System.currentTimeMillis());
+            //重新计算整个nacos注册的实例的ip字符串的md5，应该是为了安全
             service.recalculateChecksum();
             if (cluster != null) {
                 cluster.setService(service);
@@ -476,8 +476,10 @@ public class ServiceManager implements RecordListener<Service> {
             }
             service.validate();
 
+            // 将service put到servicemap并且启动service的instance健康检查，并且将service添加进事件监听器，便于调用service的onchang事件等
             putServiceAndInit(service);
             if (!local) {
+                //持久化
                 addOrReplaceService(service);
             }
         }
@@ -495,15 +497,16 @@ public class ServiceManager implements RecordListener<Service> {
      */
     public void registerInstance(String namespaceId, String serviceName, Instance instance) throws NacosException {
 
+        // 只创建一个service空对象，没有添加instance实例。注意理解servicemap的层级结构
         createEmptyService(namespaceId, serviceName, instance.isEphemeral());
-
+        // 得到service
         Service service = getService(namespaceId, serviceName);
 
         if (service == null) {
             throw new NacosException(NacosException.INVALID_PARAM,
                 "service not found, namespace: " + namespaceId + ", service: " + serviceName);
         }
-
+        // 往service里添加实例（ip等）
         addInstance(namespaceId, serviceName, instance.isEphemeral(), instance);
     }
 
@@ -523,18 +526,32 @@ public class ServiceManager implements RecordListener<Service> {
         addInstance(namespaceId, serviceName, instance.isEphemeral(), instance);
     }
 
+    /**
+     * 添加实例
+     *
+     * @param namespaceId
+     * @param serviceName
+     * @param ephemeral
+     * @param ips
+     * @throws NacosException
+     */
     public void addInstance(String namespaceId, String serviceName, boolean ephemeral, Instance... ips) throws NacosException {
 
+        //根据是否是临时（ap）还是非临时（cp），创建key
+        //ap： com.alibaba.nacos.naming.iplist.ephemeral.namespaceId(public)##serviceName
+        //cp： com.alibaba.nacos.naming.iplist.namespaceId(public)##serviceName
         String key = KeyBuilder.buildInstanceListKey(namespaceId, serviceName, ephemeral);
 
         Service service = getService(namespaceId, serviceName);
 
         synchronized (service) {
+            //添加instance信息
             List<Instance> instanceList = addIpAddresses(service, ephemeral, ips);
 
             Instances instances = new Instances();
             instances.setInstanceList(instanceList);
 
+            //集群一致性 TODO，udp通知对该服务感兴趣的client
             consistencyService.put(key, instances);
         }
     }
@@ -582,11 +599,24 @@ public class ServiceManager implements RecordListener<Service> {
         return null;
     }
 
+    /**
+     * 更新同一个service的instance信息，
+     * 追加instance或者删除instance
+     *
+     * @param service
+     * @param action
+     * @param ephemeral
+     * @param ips
+     * @return
+     * @throws NacosException
+     */
     public List<Instance> updateIpAddresses(Service service, String action, boolean ephemeral, Instance... ips) throws NacosException {
 
+        //获取本地已经存在的service集群数据，比如订单服务。这里是从datastore中取得（datastore，用于nacos集群间同步数据，同步来的数据也是存放在datastore）
         Datum datum = consistencyService.get(KeyBuilder.buildInstanceListKey(service.getNamespaceId(), service.getName(), ephemeral));
 
         List<Instance> currentIPs = service.allIPs(ephemeral);
+        //现在的instance及其id
         Map<String, Instance> currentInstances = new HashMap<>(currentIPs.size());
         Set<String> currentInstanceIds = Sets.newHashSet();
 
@@ -597,6 +627,7 @@ public class ServiceManager implements RecordListener<Service> {
 
         Map<String, Instance> instanceMap;
         if (datum != null) {
+            //已经有注册过相同服务（比如订单服务）
             instanceMap = setValid(((Instances) datum.value).getInstanceList(), currentInstances);
         } else {
             instanceMap = new HashMap<>(ips.length);
@@ -612,9 +643,12 @@ public class ServiceManager implements RecordListener<Service> {
             }
 
             if (UtilsAndCommons.UPDATE_INSTANCE_ACTION_REMOVE.equals(action)) {
+                //删除instance实例，离线
                 instanceMap.remove(instance.getDatumKey());
             } else {
+                //生成新instanceid 可以基于雪花算法，有实现
                 instance.setInstanceId(instance.generateInstanceId(currentInstanceIds));
+                //添加新实例
                 instanceMap.put(instance.getDatumKey(), instance);
             }
 
@@ -628,10 +662,26 @@ public class ServiceManager implements RecordListener<Service> {
         return new ArrayList<>(instanceMap.values());
     }
 
+    /**
+     * 删除instance
+     * @param service
+     * @param ephemeral
+     * @param ips
+     * @return
+     * @throws NacosException
+     */
     public List<Instance> substractIpAddresses(Service service, boolean ephemeral, Instance... ips) throws NacosException {
         return updateIpAddresses(service, UtilsAndCommons.UPDATE_INSTANCE_ACTION_REMOVE, ephemeral, ips);
     }
 
+    /**
+     *  添加instance
+     * @param service
+     * @param ephemeral
+     * @param ips
+     * @return
+     * @throws NacosException
+     */
     public List<Instance> addIpAddresses(Service service, boolean ephemeral, Instance... ips) throws NacosException {
         return updateIpAddresses(service, UtilsAndCommons.UPDATE_INSTANCE_ACTION_ADD, ephemeral, ips);
     }
@@ -661,9 +711,16 @@ public class ServiceManager implements RecordListener<Service> {
         return getService(namespaceId, serviceName) != null;
     }
 
+    /**
+     * 将service存放进本地servicemap
+     *
+     * @param service
+     */
     public void putService(Service service) {
         if (!serviceMap.containsKey(service.getNamespaceId())) {
             synchronized (putServiceLock) {
+                //Q：为什么还要在判断一次？
+                //A：servicemanage单例，多线程下，如果此时心跳请求（http）先于服务注册（网络波动，服务注册失败），此时可能已经有数据。
                 if (!serviceMap.containsKey(service.getNamespaceId())) {
                     serviceMap.put(service.getNamespaceId(), new ConcurrentHashMap<>(16));
                 }
@@ -672,10 +729,23 @@ public class ServiceManager implements RecordListener<Service> {
         serviceMap.get(service.getNamespaceId()).put(service.getName(), service);
     }
 
+    /**
+     * 1. 将service存放进servicemap
+     * 2. 启动心跳检查任务
+     * 3. 基于观察者设计模式，添加事件监听器 （nacos设计的精髓）
+     *
+     * @param service
+     * @throws NacosException
+     */
     private void putServiceAndInit(Service service) throws NacosException {
+        //将service存放进servicemap
         putService(service);
+        //启动service心跳检查任务（service下所有instance的健康检查）
         service.init();
+        //添加service级别的事件监听器  --->  基于观察者设计模式，反向调用Record接口的实现（service，instance，switchservice）的onchange等事件
+        //ap-->集群采用ali内部的distro协议。----->com.alibaba.nacos.naming.consistency.ephemeral.distro.DistroConsistencyServiceImpl
         consistencyService.listen(KeyBuilder.buildInstanceListKey(service.getNamespaceId(), service.getName(), true), service);
+        //cp-->集群采用raft协议。-----> com.alibaba.nacos.naming.consistency.persistent.raft.RaftConsistencyServiceImpl
         consistencyService.listen(KeyBuilder.buildInstanceListKey(service.getNamespaceId(), service.getName(), false), service);
         Loggers.SRV_LOG.info("[NEW-SERVICE] {}", service.toJSON());
     }
@@ -826,37 +896,37 @@ public class ServiceManager implements RecordListener<Service> {
                     stream = stringServiceMap.entrySet().stream();
                 }
                 stream
-                        .filter(entry -> {
-                            final String serviceName = entry.getKey();
-                            return distroMapper.responsible(serviceName);
-                        })
-                        .forEach(entry -> stringServiceMap.computeIfPresent(entry.getKey(), (serviceName, service) -> {
-                    if (service.isEmpty()) {
+                    .filter(entry -> {
+                        final String serviceName = entry.getKey();
+                        return distroMapper.responsible(serviceName);
+                    })
+                    .forEach(entry -> stringServiceMap.computeIfPresent(entry.getKey(), (serviceName, service) -> {
+                        if (service.isEmpty()) {
 
-                        // To avoid violent Service removal, the number of times the Service
-                        // experiences Empty is determined by finalizeCnt, and if the specified
-                        // value is reached, it is removed
+                            // To avoid violent Service removal, the number of times the Service
+                            // experiences Empty is determined by finalizeCnt, and if the specified
+                            // value is reached, it is removed
 
-                        if (service.getFinalizeCount() > maxFinalizeCount) {
-                            Loggers.SRV_LOG.warn("namespace : {}, [{}] services are automatically cleaned",
+                            if (service.getFinalizeCount() > maxFinalizeCount) {
+                                Loggers.SRV_LOG.warn("namespace : {}, [{}] services are automatically cleaned",
                                     namespace, serviceName);
-                            try {
-                                easyRemoveService(namespace, serviceName);
-                            } catch (Exception e) {
-                                Loggers.SRV_LOG.error("namespace : {}, [{}] services are automatically clean has " +
+                                try {
+                                    easyRemoveService(namespace, serviceName);
+                                } catch (Exception e) {
+                                    Loggers.SRV_LOG.error("namespace : {}, [{}] services are automatically clean has " +
                                         "error : {}", namespace, serviceName, e);
+                                }
                             }
-                        }
 
-                        service.setFinalizeCount(service.getFinalizeCount() + 1);
+                            service.setFinalizeCount(service.getFinalizeCount() + 1);
 
-                        Loggers.SRV_LOG.debug("namespace : {}, [{}] The number of times the current service experiences " +
+                            Loggers.SRV_LOG.debug("namespace : {}, [{}] The number of times the current service experiences " +
                                 "an empty instance is : {}", namespace, serviceName, service.getFinalizeCount());
-                    } else {
-                        service.setFinalizeCount(0);
-                    }
-                    return service;
-                }));
+                        } else {
+                            service.setFinalizeCount(0);
+                        }
+                        return service;
+                    }));
             });
         }
     }
